@@ -88,6 +88,12 @@ max_critical_task_retries = 10
 # for increasing the priority if competing with multiple provers during the
 # same block
 #lockin_priority_gas = 100
+# Enable ultra-fast locking with minimal checks
+#race_mode = false
+# Skip profitability filters (useful for incentive phases)
+#disable_profitability_checks = false
+# Minimum gas price bump percentage for RBF resubmissions
+#rbf_bump_percent = 12
 # Optional balance warning threshold (in native token)
 #
 # If the submitter balance drops below this the broker will issue warning logs

@@ -261,6 +261,17 @@ Once your broker is running, there are a few methods to optimize the lock-in rat
 
 1. Decreasing the `mcycle_price` would tune your Broker to bid at lower prices for proofs.
 2. Increasing `lockin_priority_gas` expedites your market operations by consuming more gas which could help outrun other bidders.
+3. Enabling `race_mode` skips most preflight and profitability checks for the fastest possible lock-in. Combine with `disable_profitability_checks` during incentive campaigns.
+
+Example configuration:
+
+```toml
+[market]
+race_mode = true
+lockin_priority_gas = 30
+disable_profitability_checks = true
+rbf_bump_percent = 15
+```
 
 ### Tuning Service Settings
 

@@ -77,6 +77,10 @@ mod defaults {
     pub const fn max_concurrent_preflights() -> u32 {
         4
     }
+
+    pub const fn rbf_bump_percent() -> u64 {
+        12
+    }
 }
 
 /// Order pricing priority mode for determining which orders to price first
@@ -179,6 +183,15 @@ pub struct MarketConf {
     /// for increasing the priority if competing with multiple provers during the
     /// same block
     pub lockin_priority_gas: Option<u64>,
+    /// Enable ultra-fast race mode. Skips heavy preflight checks and profitability filters.
+    #[serde(default)]
+    pub race_mode: bool,
+    /// Disable profitability filters even when not in race mode.
+    #[serde(default)]
+    pub disable_profitability_checks: bool,
+    /// Percent gas price bump to apply on replacement lock transactions (RBF).
+    #[serde(default = "defaults::rbf_bump_percent")]
+    pub rbf_bump_percent: u64,
     /// Max input / image file size allowed for downloading from request URLs.
     pub max_file_size: usize,
     /// Max retries for fetching input / image contents from URLs
@@ -271,6 +284,9 @@ impl Default for MarketConf {
             allow_client_addresses: None,
             deny_requestor_addresses: None,
             lockin_priority_gas: None,
+            race_mode: false,
+            disable_profitability_checks: false,
+            rbf_bump_percent: defaults::rbf_bump_percent(),
             max_file_size: 50_000_000,
             max_fetch_retries: Some(2),
             lockin_gas_estimate: defaults::lockin_gas_estimate(),
@@ -629,6 +645,9 @@ max_fetch_retries = 10
 allow_client_addresses = ["0x0000000000000000000000000000000000000000"]
 deny_requestor_addresses = ["0x0000000000000000000000000000000000000000"]
 lockin_priority_gas = 100
+race_mode = true
+disable_profitability_checks = true
+rbf_bump_percent = 20
 max_mcycle_limit = 10
 
 [prover]
@@ -674,6 +693,9 @@ error = ?"#;
         assert_eq!(config.market.max_stake, "0.1");
         assert_eq!(config.market.max_file_size, 50_000_000);
         assert_eq!(config.market.lockin_priority_gas, None);
+        assert!(!config.market.race_mode);
+        assert!(!config.market.disable_profitability_checks);
+        assert_eq!(config.market.rbf_bump_percent, 12);
 
         assert_eq!(config.prover.status_poll_ms, 1000);
         assert_eq!(config.prover.status_poll_retry_count, 3);
@@ -739,6 +761,9 @@ error = ?"#;
             assert_eq!(config.market.lockin_priority_gas, Some(100));
             assert_eq!(config.market.max_fetch_retries, Some(10));
             assert_eq!(config.market.max_mcycle_limit, Some(10));
+            assert!(config.market.race_mode);
+            assert!(config.market.disable_profitability_checks);
+            assert_eq!(config.market.rbf_bump_percent, 20);
             assert_eq!(config.prover.status_poll_ms, 1000);
             assert_eq!(config.prover.status_poll_retry_count, 2);
             assert_eq!(config.prover.req_retry_count, 1);
