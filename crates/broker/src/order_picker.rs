@@ -130,7 +130,7 @@ pub struct OrderPicker<P> {
     order_cache: OrderCache,
     preflight_cache: PreflightCache,
     order_state_tx: broadcast::Sender<OrderStateChange>,
-    last_lock_ts: Mutex<u64>,
+    last_lock_ts: Arc<Mutex<u64>>,
 }
 
 #[derive(Debug)]
@@ -200,7 +200,7 @@ where
                     .build(),
             ),
             order_state_tx,
-            last_lock_ts: Mutex::new(0),
+            last_lock_ts: Arc::new(Mutex::new(0)),
         }
     }
 
@@ -869,9 +869,7 @@ where
         let (
             max_mcycle_limit,
             peak_prove_khz,
-            min_mcycle_price,
-            min_mcycle_price_stake_token,
-            priority_requestor_addresses,
+            (min_mcycle_price, min_mcycle_price_stake_token, priority_requestor_addresses),
         ) = {
             let config = self.config.lock_all().context("Failed to read config")?;
             (
@@ -879,11 +877,15 @@ where
                 config.market.peak_prove_khz,
                 (
                     parse_ether(&config.market.mcycle_price)
-                    .context("Failed to parse mcycle_price")?,
-                parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
+                        .context("Failed to parse mcycle_price")?,
+                    parse_units(
+                        &config.market.mcycle_price_stake_token,
+                        self.stake_token_decimals,
+                    )
                     .context("Failed to parse mcycle_price")?
                     .into(),
-                config.market.priority_requestor_addresses.clone(),
+                    config.market.priority_requestor_addresses.clone(),
+                ),
             )
         };
 
