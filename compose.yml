@@ -27,8 +27,8 @@ x-agent-common: &agent-common
 
 x-exec-agent-common: &exec-agent-common
   <<: *agent-common
-  mem_limit: 4G
-  cpus: 3
+  mem_limit: 8G
+  cpus: 6
   environment:
     <<: *base-environment
     RISC0_KECCAK_PO2: ${RISC0_KECCAK_PO2:-17}
@@ -53,28 +53,33 @@ x-broker-environment: &broker-environment
 x-broker-common: &broker-common
   restart: always
   depends_on:
-    rest_api:
-      condition: service_healthy
-    gpu_prove_agent0:
-      condition: service_started
-    exec_agent0:
-      condition: service_started
-    exec_agent1:
-      condition: service_started
-    aux_agent:
-      condition: service_started
-    snark_agent:
-      condition: service_started
-    redis:
-      condition: service_healthy
-    postgres:
-      condition: service_healthy
+    - rest_api
+    - gpu_prove_agent0
+    - gpu_prove_agent1
+    - gpu_prove_agent2
+    - gpu_prove_agent3
+    - gpu_prove_agent4
+    - gpu_prove_agent5
+    - exec_agent0
+    - exec_agent1
+    - exec_agent2
+    - exec_agent3
+    - exec_agent4
+    - exec_agent5
+    - exec_agent6
+    - exec_agent7
+    - exec_agent8
+    - exec_agent9
+    - aux_agent
+    - snark_agent
+    - redis
+    - postgres
   profiles: [broker]
   build:
     context: .
     dockerfile: dockerfiles/broker.dockerfile
-  mem_limit: 2G
-  cpus: 2
+  mem_limit: 4G
+  cpus: 4
   stop_grace_period: 3h
   network_mode: host
 
@@ -126,8 +131,8 @@ services:
     image: ${MINIO_IMG:-minio/minio:RELEASE.2024-05-28T17-19-04Z}
     restart: always
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - '9000:9000'
+      - '9001:9001'
     volumes:
       - minio-data:/data
     command: server /data --console-address ":9001"
@@ -145,7 +150,7 @@ services:
     image: ${GRAFANA_IMG:-grafana/grafana:11.0.0}
     restart: unless-stopped
     ports:
-      - "3000:3000"
+     - '30000:3000'
     environment:
       - GF_SECURITY_ADMIN_USER=admin
       - GF_SECURITY_ADMIN_PASSWORD=admin
@@ -165,26 +170,66 @@ services:
       - redis
       - minio
 
+  # EXEC AGENTS (CPU preflight)
+
+  # EXEC AGENTS (CPU preflight)
   exec_agent0:
     <<: *exec-agent-common
+    gpus: all
 
   exec_agent1:
     <<: *exec-agent-common
+    gpus: all
+
+  exec_agent2:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent3:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent4:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent5:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent6:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent7:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent8:
+    <<: *exec-agent-common
+    gpus: all
+
+  exec_agent9:
+    <<: *exec-agent-common
+    gpus: all
+
 
   aux_agent:
     <<: *agent-common
-    mem_limit: 256M
+    mem_limit: 512M
     cpus: 1
+    gpus: all
     environment:
       <<: *base-environment
 
     entrypoint: /app/agent -t aux --monitor-requeue --redis-ttl ${REDIS_TTL:-57600}
 
+  # GPU PROVE AGENTS (1 par GPU)
   gpu_prove_agent0:
     <<: *agent-common
     runtime: nvidia
-    mem_limit: 4G
-    cpus: 4
+    mem_limit: 12G
+    cpus: 6
     entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
 
     # comment-out if running in CPU proving mode
@@ -197,15 +242,96 @@ services:
               device_ids: ["0"]
               capabilities: [gpu]
 
+  gpu_prove_agent1:
+    <<: *agent-common
+    runtime: nvidia
+    mem_limit: 12G
+    cpus: 6
+    entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
+
+    # comment-out if running in CPU proving mode
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # TODO: how to scale this with N gpus?
+              device_ids: ["1"]
+              capabilities: [gpu]
+
+  gpu_prove_agent2:
+    <<: *agent-common
+    runtime: nvidia
+    mem_limit: 12G
+    cpus: 6
+    entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
+
+    # comment-out if running in CPU proving mode
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # TODO: how to scale this with N gpus?
+              device_ids: ["2"]
+              capabilities: [gpu]
+
+  gpu_prove_agent3:
+    <<: *agent-common
+    runtime: nvidia
+    mem_limit: 12G
+    cpus: 6
+    entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
+
+    # comment-out if running in CPU proving mode
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # TODO: how to scale this with N gpus?
+              device_ids: ["3"]
+              capabilities: [gpu]
+
+  gpu_prove_agent4:
+    <<: *agent-common
+    runtime: nvidia
+    mem_limit: 12G
+    cpus: 6
+    entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
+
+    # comment-out if running in CPU proving mode
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # TODO: how to scale this with N gpus?
+              device_ids: ["4"]
+              capabilities: [gpu]
+
+  gpu_prove_agent5:
+    <<: *agent-common
+    runtime: nvidia
+    mem_limit: 12G
+    cpus: 6
+    entrypoint: /app/agent -t prove --redis-ttl ${REDIS_TTL:-57600}
+
+    # comment-out if running in CPU proving mode
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              # TODO: how to scale this with N gpus?
+              device_ids: ["5"]
+              capabilities: [gpu]
+
   snark_agent:
     <<: *agent-common
     entrypoint: /app/agent -t snark --redis-ttl ${REDIS_TTL:-57600}
-    environment:
-      <<: *base-environment
-
+    gpus: all
     ulimits:
-      # Needed for stark_verify bin
-      # TODO: this number was just guess and check found
       stack: 90000000
 
   rest_api:
@@ -240,36 +366,36 @@ services:
     <<: *broker-common
     volumes:
       - type: bind
-        source: ./broker.toml
+        source: /workspace/boundless-gpu0-2zrZG8mX17MqsEWY5dHHAzvJbF2/easynode/boundless/2zrZG8mX17MqsEWY5dHHAzvJbF2/boundless/broker.toml
         target: /app/broker.toml
       - broker-data:/db/
-    # Uncomment when using locally built set-builder and assessor guest programs
-    # - type: bind
-    #   source: ./target/riscv-guest/guest-set-builder/set-builder/riscv32im-risc0-zkvm-elf/release/set-builder.bin
-    #   target: /target/riscv-guest/guest-set-builder/set-builder/riscv32im-risc0-zkvm-elf/release/set-builder.bin
-    # - type: bind
-    #   source: ./target/riscv-guest/guest-assessor/assessor-guest/riscv32im-risc0-zkvm-elf/release/assessor-guest.bin
-    #   target: /target/riscv-guest/guest-assessor/assessor-guest/riscv32im-risc0-zkvm-elf/release/assessor-guest.bin
+      # Uncomment when using locally built set-builder and assessor guest programs
+      # - type: bind
+      #   source: ./target/riscv-guest/guest-set-builder/set-builder/riscv32im-risc0-zkvm-elf/release/set-builder.bin
+      #   target: /target/riscv-guest/guest-set-builder/set-builder/riscv32im-risc0-zkvm-elf/release/set-builder.bin
+      # - type: bind
+      #   source: ./target/riscv-guest/guest-assessor/assessor-guest/riscv32im-risc0-zkvm-elf/release/assessor-guest.bin
+      #   target: /target/riscv-guest/guest-assessor/assessor-guest/riscv32im-risc0-zkvm-elf/release/assessor-guest.bin
     environment:
       <<: *broker-environment
       PRIVATE_KEY: ${PRIVATE_KEY}
       RPC_URL: ${RPC_URL}
     entrypoint: /app/broker --db-url 'sqlite:///db/broker.db' --config-file /app/broker.toml --bento-api-url http://localhost:8081
 
-# # Example second broker with different configuration
-# broker2:
-#   <<: *broker-common
-#   volumes:
-#     - type: bind
-#       source: ./broker2.toml
-#       target: /app/broker.toml
-#     - broker2-data:/db/
-#   environment:
-#     <<: *broker-environment
-#     # Note: use a different variable if you want to use different private keys in each broker
-#     PRIVATE_KEY: ${PRIVATE_KEY}
-#     RPC_URL: ${RPC_URL_2}
-#   entrypoint: /app/broker --db-url 'sqlite:///db/broker2.db' --config-file /app/broker.toml --bento-api-url http://localhost:8081
+  # # Example second broker with different configuration
+  # broker2:
+  #   <<: *broker-common
+  #   volumes:
+  #     - type: bind
+  #       source: ./broker2.toml
+  #       target: /app/broker.toml
+  #     - broker2-data:/db/
+  #   environment:
+  #     <<: *broker-environment
+  #     # Note: use a different variable if you want to use different private keys in each broker
+  #     PRIVATE_KEY: ${PRIVATE_KEY}
+  #     RPC_URL: ${RPC_URL_2}
+  #   entrypoint: /app/broker --db-url 'sqlite:///db/broker2.db' --config-file /app/broker.toml --bento-api-url http://localhost:8081
 
 volumes:
   redis-data:
