@@ -130,6 +130,7 @@ pub struct OrderPicker<P> {
     order_cache: OrderCache,
     preflight_cache: PreflightCache,
     order_state_tx: broadcast::Sender<OrderStateChange>,
+    last_lock_ts: Mutex<u64>,
 }
 
 #[derive(Debug)]
@@ -199,6 +200,7 @@ where
                     .build(),
             ),
             order_state_tx,
+            last_lock_ts: Mutex::new(0),
         }
     }
 
@@ -698,7 +700,7 @@ where
         &self,
         order: &OrderRequest,
         proof_res: &ProofResult,
-        _order_gas_cost: U256,
+        order_gas_cost: U256,
         lock_expired: bool,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         if lock_expired {
@@ -876,9 +878,9 @@ where
                 config.market.max_mcycle_limit,
                 config.market.peak_prove_khz,
                 (
-                    parse_ether(&config.market.mcycle_price).context("Failed to parse mcycle_price")?,
-                    config.market.disable_profitability_checks,
-                )                parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
+                    parse_ether(&config.market.mcycle_price)
+                    .context("Failed to parse mcycle_price")?,
+                parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
                     .context("Failed to parse mcycle_price")?
                     .into(),
                 config.market.priority_requestor_addresses.clone(),
