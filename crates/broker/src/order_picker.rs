@@ -313,12 +313,8 @@ where
             return Ok(Skip);
         };
 
-        let (
-            min_deadline,
-            allowed_addresses_opt,
-            denied_addresses_opt,
-            race_mode,
-        ) = {            let config = self.config.lock_all().context("Failed to read config")?;
+        let (min_deadline, allowed_addresses_opt, denied_addresses_opt) = {
+            let config = self.config.lock_all().context("Failed to read config")?;
             (
                 config.market.min_deadline,
                 config.market.allow_client_addresses.clone(),
@@ -367,31 +363,14 @@ where
             return Ok(Skip);
         };
 
-        // Fast path for race mode: minimal checks then immediately schedule for lock/prove
-        if race_mode {
-            let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
-            return if lock_expired {
-                Ok(ProveAfterLockExpire {
-                    total_cycles: 0,
-                    lock_expire_timestamp_secs: expiry_secs,
-                    expiry_secs: order.request.offer.biddingStart + order.request.offer.timeout as u64,
-                })
-            } else {
-                Ok(Lock { total_cycles: 0, target_timestamp_secs: 0, expiry_secs })
-            };
-        }
-
 
         // Check if the stake is sane and if we can afford it
         // For lock expired orders, we don't check the max stake because we can't lock those orders.
-        let (max_stake, rbf_bump_percent) = {
+        let max_stake = {
             let config = self.config.lock_all().context("Failed to read config")?;
-            (
-                parse_units(&config.market.max_stake, self.stake_token_decimals)
-                    .context("Failed to parse max_stake")?
-                    .into(),
-                config.market.rbf_bump_percent,
-            )
+            parse_units(&config.market.max_stake, self.stake_token_decimals)
+                .context("Failed to parse max_stake")?
+                .into()
         };
 
         if !lock_expired && lockin_stake > max_stake {
@@ -431,8 +410,7 @@ where
             .current_gas_price()
             .await
             .context("Failed to get gas price")?;
-        let gas_price = U256::from(gas_price)
-            + U256::from(gas_price) * U256::from(rbf_bump_percent) / U256::from(100);
+        let gas_price = U256::from(gas_price);
         let order_gas = if lock_expired {
             // No need to include lock gas if its a lock expired order
             U256::from(
@@ -458,11 +436,10 @@ where
         let available_gas = self.available_gas_balance().await?;
         let available_stake = self.available_stake_balance().await?;
         tracing::debug!(
-            "Estimated {order_gas} gas to {} order {order_id}; {} ether @ {} gwei (rbf {}%)",
+            "Estimated {order_gas} gas to {} order {order_id}; {} ether @ {} gwei",
             if lock_expired { "fulfill" } else { "lock and fulfill" },
             format_ether(order_gas_cost),
             format_units(gas_price, "gwei").unwrap(),
-            rbf_bump_percent,
         );
 
         if order_gas_cost > order.request.offer.maxPrice && !lock_expired {
@@ -745,14 +722,11 @@ where
         order: &OrderRequest,
         proof_res: &ProofResult,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
-        let (config_min_mcycle_price_stake_tokens, disable_profitability): (U256, bool) = {
+        let config_min_mcycle_price_stake_tokens: U256 = {
             let config = self.config.lock_all().context("Failed to read config")?;
-            (
-                parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
-                    .context("Failed to parse mcycle_price")?
-                    .into(),
-                config.market.disable_profitability_checks,
-            )
+            parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
+                .context("Failed to parse mcycle_price")?
+                .into()
         };
 
         let total_cycles = U256::from(proof_res.stats.total_cycles);
@@ -770,9 +744,7 @@ where
         );
 
         // Skip the order if it will never be worth it
-        if !disable_profitability
-            && mcycle_price_in_stake_tokens < config_min_mcycle_price_stake_tokens
-        {
+        if mcycle_price_in_stake_tokens < config_min_mcycle_price_stake_tokens {
             tracing::info!(
                 "Removing under priced order (slashed stake reward too low) {} (stake price {} < config min stake price {})",
                 order.id(),
