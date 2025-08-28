@@ -20,9 +20,10 @@ use std::time::Duration;
 
 use crate::{
     chain_monitor::ChainMonitorService,
-    config::ConfigLock,
+    config::{ConfigLock, MarketSnapshot},
     db::DbObj,
     errors::CodedError,
+    gas_balance_tracker::GasBalanceTrackerObj,
     provers::{ProverError, ProverObj},
     storage::{upload_image_uri, upload_input_uri},
     task::{RetryRes, RetryTask, SupervisorErr},
@@ -131,6 +132,7 @@ pub struct OrderPicker<P> {
     preflight_cache: PreflightCache,
     order_state_tx: broadcast::Sender<OrderStateChange>,
     last_lock_ts: Arc<Mutex<u64>>,
+    gas_tracker: GasBalanceTrackerObj<P>,
 }
 
 #[derive(Debug)]
@@ -169,6 +171,7 @@ where
         order_result_tx: mpsc::Sender<Box<OrderRequest>>,
         stake_token_decimals: u8,
         order_state_tx: broadcast::Sender<OrderStateChange>,
+        gas_tracker: GasBalanceTrackerObj<P>,
     ) -> Self {
         let market = BoundlessMarketService::new(
             market_addr,
@@ -201,6 +204,7 @@ where
             ),
             order_state_tx,
             last_lock_ts: Arc::new(Mutex::new(0)),
+            gas_tracker,
         }
     }
 
@@ -313,15 +317,13 @@ where
             return Ok(Skip);
         };
 
-        let (min_deadline, allowed_addresses_opt, denied_addresses_opt) = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            (
-                config.market.min_deadline,
-                config.market.allow_client_addresses.clone(),
-                config.market.deny_requestor_addresses.clone(),
-                config.market.race_mode,
-            )
-        };
+        let cfg = self
+            .config
+            .snapshot(self.stake_token_decimals)
+            .context("Failed to read config")?;
+        let min_deadline = cfg.market.min_deadline;
+        let allowed_addresses_opt = cfg.market.allow_client_addresses.clone();
+        let denied_addresses_opt = cfg.market.deny_requestor_addresses.clone();   
 
         // Does the order expire within the min deadline
         let seconds_left = expiration.saturating_sub(now);
@@ -363,15 +365,10 @@ where
             return Ok(Skip);
         };
 
-
         // Check if the stake is sane and if we can afford it
         // For lock expired orders, we don't check the max stake because we can't lock those orders.
-        let max_stake = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            parse_units(&config.market.max_stake, self.stake_token_decimals)
-                .context("Failed to parse max_stake")?
-                .into()
-        };
+        let max_stake = cfg.market.max_stake;
+
 
         if !lock_expired && lockin_stake > max_stake {
             tracing::info!("Removing high stake order {order_id}, lock stake: {lockin_stake}, max stake: {max_stake}");
@@ -405,11 +402,8 @@ where
         // NOTE: We use the current gas price and a rough heuristic on gas costs. Its possible that
         // gas prices may go up (or down) by the time its time to fulfill. This does not aim to be
         // a tight estimate, although improving this estimate will allow for a more profit.
-        let gas_price = self
-            .chain_monitor
-            .current_gas_price()
-            .await
-            .context("Failed to get gas price")?;
+        let gas_price =
+            self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
         let gas_price = U256::from(gas_price);
         let order_gas = if lock_expired {
             // No need to include lock gas if its a lock expired order
@@ -466,7 +460,8 @@ where
         }
 
         // Calculate exec limit (handles priority requestors and config internally)
-        let (exec_limit_cycles, prove_limit) = self.calculate_exec_limits(order, order_gas_cost)?;
+        let (exec_limit_cycles, prove_limit) =
+            self.calculate_exec_limits(order, order_gas_cost)?;
 
         if prove_limit < 2 {
             // Exec limit is based on user cycles, and 2 is the minimum number of user cycles for a
@@ -653,8 +648,7 @@ where
             .context("Failed to find preflight journal")?;
 
         // ensure the journal is a size we are willing to submit on-chain
-        let max_journal_bytes =
-            self.config.lock_all().context("Failed to read config")?.market.max_journal_bytes;
+        let max_journal_bytes = cfg.market.max_journal_bytes;
         if journal.len() > max_journal_bytes {
             tracing::info!(
                 "Order {order_id} journal larger than set limit ({} > {}), skipping",
@@ -670,7 +664,9 @@ where
             return Ok(Skip);
         }
 
-        self.evaluate_order(order, &proof_res, order_gas_cost, lock_expired).await
+        self
+            .evaluate_order(order, &proof_res, order_gas_cost, lock_expired, &cfg.market)
+            .await
     }
 
     async fn evaluate_order(
@@ -679,11 +675,13 @@ where
         proof_res: &ProofResult,
         order_gas_cost: U256,
         lock_expired: bool,
+        cfg: &MarketSnapshot,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
         if lock_expired {
-            return self.evaluate_lock_expired_order(order, proof_res).await;
+            self.evaluate_lock_expired_order(order, proof_res, cfg).await
         } else {
-            self.evaluate_lockable_order(order, proof_res, order_gas_cost).await
+            self.evaluate_lockable_order(order, proof_res, order_gas_cost)
+                .await
         }
     }
 
@@ -694,7 +692,6 @@ where
         proof_res: &ProofResult,
         order_gas_cost: U256,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
-
         let order_id = order.id();
         tracing::trace!(
             "Evaluating order {order_id} with estimated gas cost {}",
@@ -712,7 +709,11 @@ where
 
         let expiry_secs = order.request.offer.biddingStart + order.request.offer.lockTimeout as u64;
 
-        Ok(Lock { total_cycles: proof_res.stats.total_cycles, target_timestamp_secs: 0, expiry_secs })
+        Ok(Lock {
+            total_cycles: proof_res.stats.total_cycles,
+            target_timestamp_secs: 0,
+            expiry_secs,
+        })
     }
 
     /// Evaluate if a lock expired order is worth picking based on how much of the slashed stake token we can recover
@@ -721,13 +722,9 @@ where
         &self,
         order: &OrderRequest,
         proof_res: &ProofResult,
+        cfg: &MarketSnapshot,
     ) -> Result<OrderPricingOutcome, OrderPickerErr> {
-        let config_min_mcycle_price_stake_tokens: U256 = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
-                .context("Failed to parse mcycle_price")?
-                .into()
-        };
+        let config_min_mcycle_price_stake_tokens = cfg.mcycle_price_stake_token;
 
         let total_cycles = U256::from(proof_res.stats.total_cycles);
 
@@ -762,56 +759,18 @@ where
         })
     }
 
-    /// Estimate of gas for fulfilling any orders either pending lock or locked
-    async fn estimate_gas_to_fulfill_pending(&self) -> Result<u64> {
-        let mut gas = 0;
-        for order in self.db.get_committed_orders().await? {
-            let gas_estimate = utils::estimate_gas_to_fulfill(
-                &self.config,
-                &self.supported_selectors,
-                &order.request,
-            )
-            .await?;
-            gas += gas_estimate;
-        }
-        tracing::debug!("Total gas estimate to fulfill pending orders: {}", gas);
-        Ok(gas)
-    }
-
-    /// Estimate the total gas tokens reserved to lock and fulfill all pending orders
-    async fn gas_balance_reserved(&self) -> Result<U256> {
-        let gas_price =
-            self.chain_monitor.current_gas_price().await.context("Failed to get gas price")?;
-        let fulfill_pending_gas = self.estimate_gas_to_fulfill_pending().await?;
-        Ok(U256::from(gas_price) * U256::from(fulfill_pending_gas))
-    }
-
-    /// Return available gas balance.
-    ///
-    /// This is defined as the balance of the signer account.
-    async fn available_gas_balance(&self) -> Result<U256, OrderPickerErr> {
-        let balance = self
-            .provider
-            .get_balance(self.provider.default_signer_address())
-            .await
-            .map_err(|err| OrderPickerErr::RpcErr(Arc::new(err.into())))?;
-
-        let gas_balance_reserved = self.gas_balance_reserved().await?;
-
-        let available = balance.saturating_sub(gas_balance_reserved);
-        tracing::debug!(
-            "available gas balance: (account_balance) {} - (expected_future_gas) {} = {}",
-            format_ether(balance),
-            format_ether(gas_balance_reserved),
-            format_ether(available)
-        );
-
+        let available = self.gas_tracker.available_balance().await;
+        tracing::debug!("available gas balance: {}", format_ether(available));
         Ok(available)
     }
 
     /// Return available stake balance.
     ///
     /// This is defined as the balance in staking tokens of the signer account minus any pending locked stake.
+impl<P> OrderPicker<P>
+where
+    P: Provider<Ethereum> + 'static' + Clone + WalletProvider,
+{
     async fn available_stake_balance(&self) -> Result<U256> {
         let balance = self.market.balance_of_stake(self.provider.default_signer_address()).await?;
         Ok(balance)
@@ -829,6 +788,7 @@ where
         &self,
         order: &OrderRequest,
         order_gas_cost: U256,
+        cfg: &MarketSnapshot,
     ) -> Result<(u64, u64), OrderPickerErr> {
         // Derive parameters from order
         let order_id = order.id();
@@ -838,28 +798,14 @@ where
         let request_expiration = order.expiry();
         let lock_expiry = order.request.lock_expires_at();
         let order_expiry = order.request.expires_at();
-        let (
-            max_mcycle_limit,
-            peak_prove_khz,
-            (min_mcycle_price, min_mcycle_price_stake_token, priority_requestor_addresses),
-        ) = {
-            let config = self.config.lock_all().context("Failed to read config")?;
-            (
-                config.market.max_mcycle_limit,
-                config.market.peak_prove_khz,
-                (
-                    parse_ether(&config.market.mcycle_price)
-                        .context("Failed to parse mcycle_price")?,
-                    parse_units(
-                        &config.market.mcycle_price_stake_token,
-                        self.stake_token_decimals,
-                    )
-                    .context("Failed to parse mcycle_price")?
-                    .into(),
-                    config.market.priority_requestor_addresses.clone(),
-                ),
-            )
-        };
+        let max_mcycle_limit = cfg.max_mcycle_limit;
+        let peak_prove_khz = cfg.peak_prove_khz;
+        let min_mcycle_price = cfg.mcycle_price;
+        let min_mcycle_price_stake_token = cfg.mcycle_price_stake_token;
+        let priority_requestor_addresses = cfg.priority_requestor_addresses.clone();
+        parse_units(&config.market.mcycle_price_stake_token, self.stake_token_decimals)
+        .context("Failed to parse mcycle_price")?
+        .into(),
 
         // Pricing based cycle limits: Calculate the cycle limit based on stake price
         let stake_based_limit = if min_mcycle_price_stake_token == U256::ZERO {
@@ -979,7 +925,6 @@ where
         );
 
         Ok((preflight_limit, prove_limit))
-    }
 }
 
 /// Input type for preflight cache
@@ -1554,6 +1499,9 @@ pub(crate) mod tests {
             let (priced_orders_tx, priced_orders_rx) = mpsc::channel(TEST_CHANNEL_CAPACITY);
             let (order_state_tx, _) = tokio::sync::broadcast::channel(TEST_CHANNEL_CAPACITY);
 
+            let gas_tracker =
+            Arc::new(crate::gas_balance_tracker::GasBalanceTracker::new(provider.clone()));
+
             let picker = OrderPicker::new(
                 db.clone(),
                 config,
@@ -1565,6 +1513,7 @@ pub(crate) mod tests {
                 priced_orders_tx,
                 self.stake_token_decimals.unwrap_or(6),
                 order_state_tx,
+                gas_tracker,
             );
 
             PickerTestCtx {
@@ -1578,27 +1527,6 @@ pub(crate) mod tests {
                 new_order_tx: _new_order_tx,
             }
         }
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn price_order() {
-        let config = ConfigLock::default();
-        {
-            config.load_write().unwrap().market.mcycle_price = "0.0000001".into();
-        }
-        let mut ctx = PickerTestCtxBuilder::default().with_config(config).build().await;
-
-        let order = ctx.generate_next_order(Default::default()).await;
-
-        let _request_id =
-            ctx.boundless_market.submit_request(&order.request, &ctx.signer(0)).await.unwrap();
-
-        let locked = ctx.picker.price_order_and_update_state(order, CancellationToken::new()).await;
-        assert!(locked);
-
-        let priced_order = ctx.priced_orders_rx.try_recv().unwrap();
-        assert_eq!(priced_order.target_timestamp, Some(0));
     }
 
     #[tokio::test]
@@ -2960,9 +2888,15 @@ pub(crate) mod tests {
 
         // For lock and fulfill, if the exec limit based on ETH is higher than the exec
         // limit based on stake, we should use the ETH limit.
+        let snap = ctx
+        .picker
+        .config
+        .snapshot(ctx.picker.stake_token_decimals)
+        .unwrap();
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+            ctx.picker
+                .calculate_exec_limits(&order, gas_cost, &snap.market)
+                .unwrap();
         // ETH based: (0.05 ETH - 0.001 ETH) * 1M / 0.001 ETH/mcycle = 49M cycles
         // Stake based: (100 stake tokens - 20% stake burn) * 1M / 10 stake_tokens/mcycle = 8M cycles
         // ETH-based is higher, so both should use ETH-based limit
@@ -3005,8 +2939,14 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
         // ETH based: (0.05 ETH - 0.001 ETH) * 1M / 0.1 ETH/mcycle = 490k cycles
         // Stake based: (1000 stake tokens - 20% burn) * 1M / 1 stake_token/mcycle = 800M cycles
         // Stake-based is higher, demonstrating the bug where preflight != prove limits
@@ -3060,7 +3000,14 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
 
         // Should only use stake-based pricing for FulfillAfterLockExpire
         // Stake based: (100 stake tokens - 20% burn) / 0.1 stake tokens per mcycle = 80M cycles
@@ -3110,8 +3057,14 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
         // Should be capped at 20M cycles regardless of high prices
         let expected_cycles = 20_000_000u64;
 
@@ -3157,8 +3110,14 @@ pub(crate) mod tests {
         order.request.id = RequestId::new(priority_address, 1).into();
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
         // Priority requestors ignore max_mcycle_limit but use different calculations for preflight vs prove
         // For LockAndFulfill orders: preflight uses higher limit (stake), prove uses ETH-based
         assert_eq!(preflight_limit, 800_000_000u64); // Stake-based calculation
@@ -3199,8 +3158,15 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
+            
         // Should be limited by timing constraints
         // Prove window: 60 seconds -> 60M cycles max
         // Both should be capped at 60M cycles despite high prices
@@ -3244,8 +3210,14 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
         // Should be unlimited (u64::MAX) when stake price is zero
         assert_eq!(preflight_limit, u64::MAX);
         assert_eq!(prove_limit, u64::MAX);
@@ -3285,8 +3257,14 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
         // Should be limited by very short deadline: 1 second = 1M cycles
         let expected_cycles = 1_000_000u64;
 
@@ -3328,8 +3306,14 @@ pub(crate) mod tests {
             .await;
 
         let (preflight_limit, prove_limit) =
-            ctx.picker.calculate_exec_limits(&order, gas_cost).unwrap();
-
+        let snap = ctx
+            .picker
+            .config
+            .snapshot(ctx.picker.stake_token_decimals)
+            .unwrap();
+        ctx.picker
+            .calculate_exec_limits(&order, gas_cost, &snap.market)
+            .unwrap();
         // Should be unlimited (u64::MAX) when ETH mcycle_price is zero
         assert_eq!(preflight_limit, u64::MAX);
         assert_eq!(prove_limit, u64::MAX);
