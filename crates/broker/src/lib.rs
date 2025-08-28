@@ -38,6 +38,7 @@ pub use config::Config;
 use config::ConfigWatcher;
 use db::{DbObj, SqliteDb};
 use provers::ProverObj;
+use gas_balance_tracker::GasBalanceTracker;
 use risc0_ethereum_contracts::set_verifier::SetVerifierService;
 use risc0_zkvm::sha::Digest;
 pub use rpc_retry_policy::CustomRetryPolicy;
@@ -58,6 +59,7 @@ pub mod config;
 pub(crate) mod db;
 pub(crate) mod errors;
 pub mod futures_retry;
+pub(crate) mod gas_balance_tracker;
 pub(crate) mod market_monitor;
 pub(crate) mod offchain_market_monitor;
 pub(crate) mod order_monitor;
@@ -785,6 +787,16 @@ where
         .stake_token_decimals()
         .await
         .context("Failed to get stake token decimals. Possible RPC error.")?;
+        // Gas balance tracker to cache account balance and reserved amounts
+        let gas_tracker = Arc::new(GasBalanceTracker::new(self.provider.clone()));
+        {
+            let tracker = gas_tracker.clone();
+            let cancel = non_critical_cancel_token.clone();
+            supervisor_tasks.spawn(async move {
+                tracker.start(30, cancel).await;
+                Ok(())
+            });
+        }
 
         // Spin up the order picker to pre-flight and find orders to lock
         let order_picker = Arc::new(order_picker::OrderPicker::new(
@@ -798,6 +810,7 @@ where
             pricing_tx,
             stake_token_decimals,
             order_state_tx.clone(),
+            gas_tracker.clone(),
         ));
         let cloned_config = config.clone();
         let cancel_token = non_critical_cancel_token.clone();
@@ -846,6 +859,8 @@ where
                 retry_count: self.args.rpc_retry_max.into(),
                 retry_sleep_ms: self.args.rpc_retry_backoff,
             },
+            gas_tracker.clone(),
+
         )?);
         let cloned_config = config.clone();
         let cancel_token = non_critical_cancel_token.clone();
@@ -908,6 +923,7 @@ where
             self.deployment().set_verifier_address,
             self.deployment().boundless_market_address,
             set_builder_img_id,
+            gas_tracker.clone(),
         )?);
         let cloned_config = config.clone();
         let cancel_token = critical_cancel_token.clone();
